@@ -255,8 +255,15 @@ static int shofer_open_read(struct inode *inode, struct file *filp)
 static int shofer_open_write(struct inode *inode, struct file *filp)
 {
 	/* todo (similar to shofer_open_read) */
-
-	return 0;
+	struct shofer_dev *shofer;
+    
+    shofer = container_of(inode->i_cdev, struct shofer_dev, cdev);
+    filp->private_data = shofer;
+    
+    if ((filp->f_flags & O_ACCMODE) != O_WRONLY)
+        return -EPERM;
+        
+    return 0;
 }
 
 /* output_dev only */
@@ -264,74 +271,141 @@ static ssize_t shofer_read(struct file *filp, char __user *ubuf, size_t count,
 	loff_t *f_pos)
 {
 	ssize_t retval = 0;
-	struct shofer_dev *shofer = filp->private_data;
-	struct buffer *out_buff = shofer->out_buff;
-	struct kfifo *fifo = &out_buff->fifo;
-	unsigned int copied;
+    struct shofer_dev *shofer = filp->private_data;
+    struct buffer *out_buff;
+    struct kfifo *fifo;
+    unsigned int copied = 0;
+    char *temp_buf;
 
-	spin_lock(&out_buff->key);
+    if (!shofer || !shofer->out_buff) {
+        klog(KERN_WARNING, "Invalid device or buffer");
+        return -EINVAL;
+    }
 
-	dump_buffer("out_dev-end:out_buff:", out_buff);
+    out_buff = shofer->out_buff;
+    fifo = &out_buff->fifo;
 
-	retval = kfifo_to_user(fifo, (char __user *) ubuf, count, &copied);
-	if (retval)
-		klog(KERN_WARNING, "kfifo_to_user failed");
-	else
-		retval = copied;
 
-	dump_buffer("out_dev-end:out_buff:", out_buff);
+    temp_buf = kmalloc(count, GFP_KERNEL);
+    if (!temp_buf) {
+        klog(KERN_WARNING, "Failed to allocate temp buffer");
+        return -ENOMEM;
+    }
 
-	spin_unlock(&out_buff->key);
+    spin_lock(&out_buff->key);
 
-	return retval;
-}
 
+    copied = kfifo_out(fifo, temp_buf, count);
+    
+    if (copied > 0) {
+
+        if (copy_to_user(ubuf, temp_buf, copied)) {
+            klog(KERN_WARNING, "copy_to_user failed");
+            retval = -EFAULT;
+        } else {
+            retval = copied;
+            klog(KERN_INFO, "Successfully read %u bytes", copied); 
+        }
+    }
+
+    spin_unlock(&out_buff->key);
+    kfree(temp_buf);
+
+    return retval;
+    
+   }
 /* input_dev only */
 static ssize_t shofer_write(struct file *filp, const char __user *ubuf,
 	size_t count, loff_t *f_pos)
 {
 	/* todo (similar to read) */
-
-	return count;
+	ssize_t retval = 0;
+    struct shofer_dev *shofer = filp->private_data;
+    struct buffer *in_buff = shofer->in_buff;
+    struct kfifo *fifo = &in_buff->fifo;
+    unsigned int copied;
+    
+    spin_lock(&in_buff->key);
+    
+    dump_buffer("in_dev-start:in_buff:", in_buff);
+    
+    retval = kfifo_from_user(fifo, (char __user *) ubuf, count, &copied);
+    if (retval)
+        klog(KERN_WARNING, "kfifo_from_user failed");
+    else
+        retval = copied;
+        
+    dump_buffer("in_dev-end:in_buff:", in_buff);
+    
+    spin_unlock(&in_buff->key);
+    
+    return retval;
 }
 
 static long control_ioctl (struct file *filp, unsigned int request, unsigned long arg)
 {
 	ssize_t retval = 0;
-	/*struct shofer_dev *shofer = filp->private_data;
-	struct buffer *in_buff = shofer->in_buff;
-	struct buffer *out_buff = shofer->out_buff;
-	struct kfifo *fifo_in = &in_buff->fifo;
-	struct kfifo *fifo_out = &out_buff->fifo;
-	char c;
-	int got;*/
-	struct shofer_ioctl cmd;
+    struct shofer_dev *shofer = filp->private_data;
+    struct buffer *in_buff = shofer->in_buff;
+    struct buffer *out_buff = shofer->out_buff;
+    struct kfifo *fifo_in = &in_buff->fifo;
+    struct kfifo *fifo_out = &out_buff->fifo;
+    struct shofer_ioctl cmd;
+    char c;
+    int got;
+    unsigned int i;
 
-	if (_IOC_TYPE(request) != SHOFER_IOCTL_TYPE || _IOC_NR(request) != SHOFER_IOCTL_NR) {
-		klog(KERN_WARNING, "IOC type and/or nr don't match");
-		return -EINVAL;
-	}
+    if (_IOC_TYPE(request) != SHOFER_IOCTL_TYPE || _IOC_NR(request) != SHOFER_IOCTL_NR) {
+        klog(KERN_WARNING, "IOC type and/or nr don't match");
+        return -EINVAL;
+    }
 
-	if (_IOC_SIZE(request) != sizeof(struct shofer_ioctl)) {
-		klog(KERN_WARNING, "Argument size doesn't match expected size");
-		return -EINVAL;
-	}
+    if (_IOC_SIZE(request) != sizeof(struct shofer_ioctl)) {
+        klog(KERN_WARNING, "Argument size doesn't match expected size");
+        return -EINVAL;
+    }
 
-	retval = copy_from_user(&cmd, (const void __user *) arg, sizeof(struct shofer_ioctl));
-	if (retval) {
-		klog(KERN_WARNING, "copy_from_user failed");
-		return retval;
-	}
+    retval = copy_from_user(&cmd, (const void __user *) arg, sizeof(struct shofer_ioctl));
+    if (retval) {
+        klog(KERN_WARNING, "copy_from_user failed");
+        return retval;
+    }
 
-	if (cmd.count == 0) {
-		klog(KERN_WARNING, "copy count is zero");
-		return retval;
-	}
+    if (cmd.count == 0) {
+        klog(KERN_WARNING, "copy count is zero");
+        return retval;
+    }
 
-	/* copy cmd.count bytes from in_buff to out_buff */
-	/* todo (similar to timer) */
+    /* Get locks on both buffers */
+    spin_lock(&out_buff->key);
+    spin_lock(&in_buff->key);
 
-	return retval;
+    /* Copy cmd.count bytes from in_buff to out_buff */
+    for (i = 0; i < cmd.count; i++) {
+        if (kfifo_len(fifo_in) > 0 && kfifo_avail(fifo_out) > 0) {
+            got = kfifo_get(fifo_in, &c);
+            if (got > 0) {
+                got = kfifo_put(fifo_out, c);
+                if (!got) {
+                    klog(KERN_WARNING, "kfifo_put failed");
+                    break;
+                }
+            }
+            else {
+                klog(KERN_WARNING, "kfifo_get failed");
+                break;
+            }
+        }
+        else {
+            break; /* Input empty or output full */
+        }
+    }
+
+    spin_unlock(&in_buff->key);
+    spin_unlock(&out_buff->key);
+
+    return retval;
+
 }
 
 static void timer_function(struct timer_list *t)
@@ -365,8 +439,7 @@ static void timer_function(struct timer_list *t)
 	}
 	else {
 		LOG("timer: nothing in input buffer");
-		//for test: put '#' in output buffer
-		got = kfifo_put(fifo_out, '#');
+		
 	}
 
 	dump_buffer("timer-end:in_buff", in_buff);
